@@ -11,7 +11,7 @@ export default defineConfig({
         enabled: true,
       },
       workbox: {
-        globPatterns: ['**/*.{js,css,html,wasm,py,zip,whl,json,svg,ttf}'],
+        globPatterns: ['**/*.{js,css,html,wasm,data,py,zip,whl,json,svg,ttf}'],
         maximumFileSizeToCacheInBytes: 50 * 1024 * 1024, // 50MB
       },
       manifest: {

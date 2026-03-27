@@ -9,6 +9,7 @@ let stdinBuffer = null
 let stdinSignalView = null
 let stdinBytesView = null
 let baseUrl = '/'
+let initializationPromise = null
 const textDecoder = new TextDecoder()
 const STDIN_SIGNAL_INDEX = 0
 const STDIN_LENGTH_INDEX = 1
@@ -57,6 +58,10 @@ function startHeartbeat() {
   }, 1000)
 }
 
+function sendHeartbeat() {
+  self.postMessage({ type: 'heartbeat' })
+}
+
 function stopHeartbeat() {
   if (heartbeatInterval) {
     clearInterval(heartbeatInterval)
@@ -93,6 +98,10 @@ function initWorker({ stdinBuffer: incomingStdinBuffer, baseUrl: incomingBaseUrl
   if (stdinSignalView) {
     Atomics.store(stdinSignalView, STDIN_SIGNAL_INDEX, 0)
     Atomics.store(stdinSignalView, STDIN_LENGTH_INDEX, 0)
+  }
+
+  if (!initializationPromise) {
+    initializationPromise = initPyodide()
   }
 }
 
@@ -243,15 +252,24 @@ sys.stderr = _WasmForgeStderr()
 builtins.input = _wasmforge_input
     `)
 
+    self.postMessage({ type: 'load_progress', msg: 'Preloading numpy and pandas...' })
+    await pyodide.loadPackage(['numpy', 'pandas'])
+
     self.postMessage({ type: 'ready' })
 
   } catch (err) {
     self.postMessage({ type: 'stderr', data: `[WasmForge] Failed to load Pyodide: ${err.message}\n` })
     self.postMessage({ type: 'done', error: err.message })
+    initializationPromise = null
+    pyodide = null
   }
 }
 
 async function runPython(code, filename = 'main.py') {
+  if (initializationPromise) {
+    await initializationPromise
+  }
+
   if (!pyodide) {
     self.postMessage({ type: 'stderr', data: '[WasmForge] Runtime not ready. Please wait.\n' })
     self.postMessage({ type: 'done', error: 'Runtime not ready' })
@@ -260,6 +278,7 @@ async function runPython(code, filename = 'main.py') {
 
   stopHeartbeat()
   stopFlushInterval()
+  sendHeartbeat()
   startHeartbeat()
   startFlushInterval()
 
@@ -332,5 +351,3 @@ self.onmessage = async (event) => {
       console.warn('[WasmForge Worker] Unknown message type:', type)
   }
 }
-
-initPyodide()

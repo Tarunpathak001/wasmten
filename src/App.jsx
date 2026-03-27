@@ -1,16 +1,24 @@
 import { lazy, Suspense, useState, useRef, useCallback, useEffect } from "react";
 import Terminal from "./components/Terminal.jsx";
 import FileTree from "./components/FileTree.jsx";
+import SqlResultsPanel from "./components/SqlResultsPanel.jsx";
 import { usePyodideWorker } from "./hooks/usePyodideWorker.js";
 import { useIOWorker } from "./hooks/useIOWorker.js";
+import { useJsWorker } from "./hooks/useJsWorker.js";
+import { useSqlWorkers } from "./hooks/useSqlWorkers.js";
 import { DEFAULT_PYTHON } from "./constants/defaultPython.js";
+import {
+  getFileExtension,
+  getRuntimeKind,
+  getSqlDatabaseDescriptor,
+} from "./utils/sqlRuntime.js";
 
 const DEFAULT_FILENAME = "main.py";
 const RECOVERY_STORAGE_KEY = "wasmforge:pending-workspace-writes";
 const Editor = lazy(() => import("./components/Editor.jsx"));
 
 function getLanguage(filename) {
-  const ext = filename.split(".").pop()?.toLowerCase();
+  const ext = getFileExtension(filename);
   switch (ext) {
     case "py":
       return "python";
@@ -43,6 +51,20 @@ function chooseActiveFile(filenames, preferredFile) {
 
 function sortFileRecords(files) {
   return [...files].sort((left, right) => left.name.localeCompare(right.name));
+}
+
+function createEmptySqlExecution() {
+  return {
+    engine: null,
+    engineLabel: "",
+    filename: "",
+    databaseLabel: "",
+    resultSets: [],
+    error: "",
+    durationMs: null,
+    executedAt: null,
+    restoredFromOpfs: false,
+  };
 }
 
 function readRecoveryEntries() {
@@ -86,6 +108,7 @@ export default function App() {
   const [files, setFiles] = useState([]);
   const [activeFile, setActiveFile] = useState(DEFAULT_FILENAME);
   const [status, setStatus] = useState("Restoring workspace...");
+  const [sqlExecution, setSqlExecution] = useState(createEmptySqlExecution);
   const terminalRef = useRef(null);
   const submitStdinRef = useRef(() => false);
   const editorRef = useRef(null);
@@ -160,6 +183,9 @@ export default function App() {
     listFiles,
     readFile,
     writeFile,
+    fileExists,
+    readBinaryFile,
+    writeBinaryFile,
     scheduleWrite,
     flushAllWrites,
   } = useIOWorker({
@@ -169,6 +195,23 @@ export default function App() {
       );
     },
     onWriteFlushed: clearRecoveryWrite,
+  });
+
+  const {
+    sqliteReady,
+    pgliteReady,
+    sqliteStatus,
+    pgliteStatus,
+    isRunning: isSqlRunning,
+    runningEngine,
+    runSqliteQuery,
+    runPgliteQuery,
+  } = useSqlWorkers({
+    onError: (error, engine) => {
+      reportWorkspaceError(
+        `[WasmForge] ${engine === "sqlite" ? "SQLite" : "PostgreSQL"} worker failed: ${error.message || error}`,
+      );
+    },
   });
 
   const upsertFileContent = useCallback((filename, content) => {
@@ -256,6 +299,12 @@ export default function App() {
     },
     [refreshWorkspaceFiles, reportWorkspaceError],
   );
+
+  const handleJavascriptDone = useCallback((error) => {
+    if (!error) {
+      terminalRef.current?.writeln("\x1b[90m\n[Process completed]\x1b[0m");
+    }
+  }, []);
 
   const syncActiveEditorDraft = useCallback(
     ({ scheduleWorkerWrite = true, updateState = true } = {}) => {
@@ -354,6 +403,87 @@ export default function App() {
     submitStdinRef.current = submitStdin;
   }, [submitStdin]);
 
+  const {
+    runCode: runJsCode,
+    killWorker: killJsWorker,
+    isReady: isJsReady,
+    isRunning: isJsRunning,
+    status: jsStatus,
+  } = useJsWorker({
+    onStdout: writeStdout,
+    onStderr: writeStderr,
+    onReady: () => {
+      terminalRef.current?.writeln(
+        "\x1b[32m✓ JS/TS runtime ready (sandboxed worker + TypeScript transpile)\x1b[0m",
+      );
+      terminalRef.current?.writeln("");
+    },
+    onDone: handleJavascriptDone,
+  });
+
+  const executeSqliteFile = useCallback(
+    async ({ filename, code }) => {
+      const database = getSqlDatabaseDescriptor(filename);
+      if (!database) {
+        throw new Error("No SQLite database descriptor available");
+      }
+
+      const snapshotExists = await fileExists(database.databaseKey, "sqlite");
+      const databaseBuffer = snapshotExists
+        ? await readBinaryFile(database.databaseKey, "sqlite")
+        : null;
+
+      const result = await runSqliteQuery({
+        sql: code,
+        databaseKey: database.databaseKey,
+        databaseLabel: database.databaseLabel,
+        databaseBuffer,
+      });
+      const { databaseBuffer: exportedDatabase, ...uiResult } = result;
+
+      if (exportedDatabase) {
+        await writeBinaryFile(
+          database.databaseKey,
+          exportedDatabase,
+          "sqlite",
+        );
+      }
+
+      setSqlExecution({
+        ...uiResult,
+        filename,
+        databaseLabel: database.databaseLabel,
+        executedAt: Date.now(),
+        restoredFromOpfs: snapshotExists,
+      });
+    },
+    [fileExists, readBinaryFile, runSqliteQuery, writeBinaryFile],
+  );
+
+  const executePgliteFile = useCallback(
+    async ({ filename, code }) => {
+      const database = getSqlDatabaseDescriptor(filename);
+      if (!database) {
+        throw new Error("No PostgreSQL database descriptor available");
+      }
+
+      const result = await runPgliteQuery({
+        sql: code,
+        databaseKey: database.databaseKey,
+        databaseLabel: database.databaseLabel,
+      });
+
+      setSqlExecution({
+        ...result,
+        filename,
+        databaseLabel: database.databaseLabel,
+        executedAt: Date.now(),
+        restoredFromOpfs: true,
+      });
+    },
+    [runPgliteQuery],
+  );
+
   useEffect(() => {
     if (!isIOWorkerReady) {
       return;
@@ -416,8 +546,14 @@ export default function App() {
 
   const handleKill = useCallback(() => {
     terminalRef.current?.cancelInput({ reason: "^C" });
+
+    if (getRuntimeKind(activeFileRef.current) === "javascript") {
+      killJsWorker();
+      return;
+    }
+
     killWorker();
-  }, [killWorker]);
+  }, [killJsWorker, killWorker]);
 
   const handleRun = useCallback(async () => {
     terminalRef.current?.cancelInput({ newline: false });
@@ -427,11 +563,16 @@ export default function App() {
       return;
     }
 
-    const ext = activeFile.split(".").pop()?.toLowerCase();
+    const runtime = getRuntimeKind(activeFile);
+    const codeToRun =
+      syncedSnapshot?.filename === activeFile
+        ? syncedSnapshot.content
+        : file.content;
+
     terminalRef.current?.writeln(`\x1b[90m$ Running ${activeFile}...\x1b[0m\n`);
 
-    switch (ext) {
-      case "py":
+    switch (runtime) {
+      case "python":
         if (!isReady) {
           terminalRef.current?.writeln(
             "\x1b[33m[WasmForge] Python runtime still loading. Please wait...\x1b[0m",
@@ -450,25 +591,120 @@ export default function App() {
 
         runCode({
           filename: activeFile,
-          code: syncedSnapshot?.filename === activeFile
-            ? syncedSnapshot.content
-            : file.content,
+          code: codeToRun,
         });
         setStatus("Running...");
         break;
 
-      case "js":
-      case "ts":
-        terminalRef.current?.writeln(
-          "\x1b[33m[WasmForge] JS/TS Worker coming in Phase 6.\x1b[0m\n",
-        );
+      case "javascript":
+        if (!isJsReady) {
+          terminalRef.current?.writeln(
+            "\x1b[33m[WasmForge] JS/TS runtime still loading. Please wait...\x1b[0m",
+          );
+          return;
+        }
+
+        try {
+          await flushAllWrites();
+        } catch (error) {
+          reportWorkspaceError(
+            `[WasmForge] Failed to persist files before JS/TS execution: ${error.message || error}`,
+          );
+          return;
+        }
+
+        runJsCode({
+          filename: activeFile,
+          code: codeToRun,
+        });
         break;
 
-      case "sql":
-      case "pg":
-        terminalRef.current?.writeln(
-          "\x1b[33m[WasmForge] SQL Workers coming in Phase 5.\x1b[0m\n",
-        );
+      case "sqlite":
+        if (!sqliteReady) {
+          setSqlExecution({
+            ...createEmptySqlExecution(),
+            engine: "sqlite",
+            engineLabel: "SQLite",
+            filename: activeFile,
+            error: "SQLite runtime is still loading. Please wait a moment and try again.",
+            executedAt: Date.now(),
+          });
+          break;
+        }
+
+        if (!codeToRun.trim()) {
+          setSqlExecution({
+            ...createEmptySqlExecution(),
+            engine: "sqlite",
+            engineLabel: "SQLite",
+            filename: activeFile,
+            error: "SQL file is empty. Add CREATE/INSERT/SELECT statements and run again.",
+            executedAt: Date.now(),
+          });
+          break;
+        }
+
+        try {
+          await executeSqliteFile({
+            filename: activeFile,
+            code: codeToRun,
+          });
+        } catch (error) {
+          const database = getSqlDatabaseDescriptor(activeFile);
+          setSqlExecution({
+            ...createEmptySqlExecution(),
+            engine: "sqlite",
+            engineLabel: "SQLite",
+            filename: activeFile,
+            databaseLabel: database?.databaseLabel ?? "",
+            error: error.message || String(error),
+            executedAt: Date.now(),
+          });
+        }
+        break;
+
+      case "pglite":
+        if (!pgliteReady) {
+          setSqlExecution({
+            ...createEmptySqlExecution(),
+            engine: "pglite",
+            engineLabel: "PostgreSQL (PGlite)",
+            filename: activeFile,
+            error: "PostgreSQL runtime is still loading. Please wait a moment and try again.",
+            executedAt: Date.now(),
+          });
+          break;
+        }
+
+        if (!codeToRun.trim()) {
+          setSqlExecution({
+            ...createEmptySqlExecution(),
+            engine: "pglite",
+            engineLabel: "PostgreSQL (PGlite)",
+            filename: activeFile,
+            error: "SQL file is empty. Add PostgreSQL statements and run again.",
+            executedAt: Date.now(),
+          });
+          break;
+        }
+
+        try {
+          await executePgliteFile({
+            filename: activeFile,
+            code: codeToRun,
+          });
+        } catch (error) {
+          const database = getSqlDatabaseDescriptor(activeFile);
+          setSqlExecution({
+            ...createEmptySqlExecution(),
+            engine: "pglite",
+            engineLabel: "PostgreSQL (PGlite)",
+            filename: activeFile,
+            databaseLabel: database?.databaseLabel ?? "",
+            error: error.message || String(error),
+            executedAt: Date.now(),
+          });
+        }
         break;
 
       default:
@@ -480,10 +716,16 @@ export default function App() {
     files,
     activeFile,
     isReady,
+    isJsReady,
+    sqliteReady,
+    pgliteReady,
     flushAllWrites,
     runCode,
+    runJsCode,
     reportWorkspaceError,
     syncActiveEditorDraft,
+    executeSqliteFile,
+    executePgliteFile,
   ]);
 
   const handleFileSelect = useCallback(
@@ -559,17 +801,70 @@ export default function App() {
   }, [files, flushAllWrites, writeFile, reportWorkspaceError, syncActiveEditorDraft]);
 
   const activeFileData = files.find((file) => file.name === activeFile);
-
+  const activeRuntime = getRuntimeKind(activeFile);
+  const showResultsPanel =
+    activeRuntime === "sqlite" || activeRuntime === "pglite";
+  const activeSqlResult =
+    sqlExecution.filename === activeFile ? sqlExecution : null;
+  const activeRuntimeReady =
+    activeRuntime === "python"
+      ? isReady
+      : activeRuntime === "javascript"
+        ? isJsReady
+      : activeRuntime === "sqlite"
+        ? sqliteReady
+        : activeRuntime === "pglite"
+          ? pgliteReady
+          : false;
+  const activeRuntimeRunning =
+    activeRuntime === "python"
+      ? isRunning
+      : activeRuntime === "javascript"
+        ? isJsRunning
+      : isSqlRunning && runningEngine === activeRuntime;
+  const isAnyRuntimeBusy = isRunning || isJsRunning || isSqlRunning;
+  const activeStatusMessage =
+    activeRuntime === "sqlite"
+      ? sqliteStatus
+      : activeRuntime === "pglite"
+        ? pgliteStatus
+        : activeRuntime === "javascript"
+          ? jsStatus
+          : activeRuntime === "unknown"
+            ? "Unsupported file type"
+        : status;
+  const activeHasError =
+    activeRuntime === "python"
+      ? status === "Error"
+      : activeRuntime === "javascript"
+        ? jsStatus === "Execution failed" || jsStatus === "JS/TS runtime crashed"
+      : Boolean(activeSqlResult?.error);
+  const canKillActiveRuntime =
+    activeRuntime === "python" || activeRuntime === "javascript";
+  const terminalRuntimeLabel =
+    activeRuntime === "javascript" ? "JS/TS" : "Python";
+  const terminalRuntimeAccent =
+    activeRuntime === "javascript"
+      ? {
+          color: "#d29922",
+          background: "#362708",
+          border: "1px solid #6b4f18",
+        }
+      : {
+          color: "#3fb950",
+          background: "#0d2b1a",
+          border: "1px solid #1e4a2a",
+        };
   const statusColor =
-    status === "Error"
+    activeHasError
       ? "#ff7b72"
-      : isAwaitingInput
+      : activeRuntime === "python" && isAwaitingInput
         ? "#58a6ff"
-      : isRunning
-        ? "#f0883e"
-        : isReady
-          ? "#3fb950"
-          : "#8b949e";
+        : activeRuntimeRunning
+          ? "#f0883e"
+          : activeRuntimeReady
+            ? "#3fb950"
+            : "#8b949e";
 
   return (
     <div
@@ -607,21 +902,32 @@ export default function App() {
 
         <div style={{ flex: 1 }} />
 
-        <span style={{ fontSize: "12px", color: statusColor }}>● {status}</span>
+        <span style={{ fontSize: "12px", color: statusColor }}>
+          ● {activeStatusMessage}
+        </span>
 
-        {isRunning ? (
+        {canKillActiveRuntime && activeRuntimeRunning ? (
           <button onClick={handleKill} style={btnStyle("#c0392b", "#e74c3c")}>
             ■ Kill
           </button>
         ) : (
           <button
             onClick={handleRun}
+            disabled={
+              isAnyRuntimeBusy ||
+              activeRuntime === "unknown" ||
+              !activeRuntimeReady
+            }
             style={btnStyle(
-              isReady ? "#238636" : "#1c2128",
-              isReady ? "#2ea043" : "#30363d",
+              activeRuntimeReady ? "#238636" : "#1c2128",
+              activeRuntimeReady ? "#2ea043" : "#30363d",
             )}
           >
-            ▶️ Run
+            {activeRuntimeRunning
+              ? "Running..."
+              : isAnyRuntimeBusy
+                ? "Runtime busy"
+                : "▶️ Run"}
           </button>
         )}
 
@@ -698,23 +1004,61 @@ export default function App() {
                 letterSpacing: "0.08em",
               }}
             >
-              Terminal
+              {showResultsPanel ? "Results" : "Terminal"}
             </span>
             <span
               style={{
                 fontSize: "10px",
-                color: "#3fb950",
-                background: "#0d2b1a",
+                color: showResultsPanel
+                  ? activeRuntime === "sqlite"
+                    ? "#58a6ff"
+                    : "#56d364"
+                  : terminalRuntimeAccent.color,
+                background: showResultsPanel
+                  ? activeRuntime === "sqlite"
+                    ? "#0d2538"
+                    : "#0f2e1f"
+                  : terminalRuntimeAccent.background,
                 padding: "1px 6px",
                 borderRadius: "10px",
-                border: "1px solid #1e4a2a",
+                border: showResultsPanel
+                  ? activeRuntime === "sqlite"
+                    ? "1px solid #1f6feb"
+                    : "1px solid #238636"
+                  : terminalRuntimeAccent.border,
               }}
             >
-              Python
+              {showResultsPanel
+                ? activeRuntime === "sqlite"
+                  ? "SQLite"
+                  : "PGlite"
+                : terminalRuntimeLabel}
             </span>
           </div>
-          <div style={{ height: "calc(100% - 28px)" }}>
-            <Terminal ref={terminalRef} />
+          <div style={{ height: "calc(100% - 28px)", position: "relative" }}>
+            <div
+              style={{
+                display: showResultsPanel ? "none" : "block",
+                height: "100%",
+              }}
+            >
+              <Terminal ref={terminalRef} />
+            </div>
+            <div
+              style={{
+                display: showResultsPanel ? "block" : "none",
+                height: "100%",
+              }}
+            >
+              <SqlResultsPanel
+                activeFile={activeFile}
+                engine={activeRuntime}
+                result={activeSqlResult}
+                isReady={activeRuntimeReady}
+                isRunning={activeRuntimeRunning}
+                status={activeStatusMessage}
+              />
+            </div>
           </div>
         </div>
       </div>

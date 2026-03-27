@@ -104,6 +104,19 @@ export function useIOWorker({ onError, onWriteFlushed } = {}) {
   const listFiles = useCallback(() => callWorker({ type: 'list' }), [callWorker])
   const readFile = useCallback((filename) => callWorker({ type: 'read', filename }), [callWorker])
   const writeFile = useCallback((filename, content) => callWorker({ type: 'write', filename, content }), [callWorker])
+  const fileExists = useCallback(
+    (filename, scope = 'workspace') => callWorker({ type: 'exists', filename, scope }),
+    [callWorker],
+  )
+  const readBinaryFile = useCallback(
+    (filename, scope = 'sqlite') => callWorker({ type: 'read_binary', filename, scope }),
+    [callWorker],
+  )
+  const writeBinaryFile = useCallback(
+    (filename, content, scope = 'sqlite') =>
+      callWorker({ type: 'write_binary', filename, content, scope }),
+    [callWorker],
+  )
   const flushWrite = useCallback((filename) => callWorker({ type: 'flush', filename }), [callWorker])
   const flushAllWrites = useCallback(() => callWorker({ type: 'flush_all' }), [callWorker])
 
@@ -112,6 +125,9 @@ export function useIOWorker({ onError, onWriteFlushed } = {}) {
     listFiles,
     readFile,
     writeFile,
+    fileExists,
+    readBinaryFile,
+    writeBinaryFile,
     scheduleWrite,
     flushWrite,
     flushAllWrites,

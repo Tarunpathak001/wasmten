@@ -145,7 +145,7 @@ const Terminal = forwardRef(function Terminal({ onResize }, ref) {
     xterm.writeln('\x1b[1;34m========================================\x1b[0m')
     xterm.writeln('\x1b[1;34m|  \x1b[1;37mWasmForge\x1b[0m\x1b[1;34m - Zero Backend IDE      |\x1b[0m')
     xterm.writeln('\x1b[1;34m========================================\x1b[0m')
-    xterm.writeln('\x1b[90mInitializing Python runtime (Pyodide)...\x1b[0m')
+    xterm.writeln('\x1b[90mInitializing browser runtimes (Pyodide + JS/TS worker)...\x1b[0m')
     xterm.writeln('')
 
     const dataListener = xterm.onData((data) => {
