@@ -4,6 +4,8 @@ export function useIOWorker({ onError, onWriteFlushed } = {}) {
   const workerRef = useRef(null)
   const nextRequestIdRef = useRef(0)
   const pendingRequestsRef = useRef(new Map())
+  const scheduledWritesRef = useRef([])
+  const createWorkerRef = useRef(null)
   const onErrorRef = useRef(onError)
   const onWriteFlushedRef = useRef(onWriteFlushed)
   const [isReady, setIsReady] = useState(false)
@@ -23,12 +25,18 @@ export function useIOWorker({ onError, onWriteFlushed } = {}) {
     pendingRequestsRef.current.clear()
   }, [])
 
-  useEffect(() => {
-    const worker = new Worker(
-      new URL('../workers/io.worker.js', import.meta.url),
-      { type: 'classic' }
-    )
+  const flushScheduledWrites = useCallback(() => {
+    if (!workerRef.current || scheduledWritesRef.current.length === 0) {
+      return
+    }
 
+    const queuedWrites = scheduledWritesRef.current.splice(0)
+    for (const payload of queuedWrites) {
+      workerRef.current.postMessage(payload)
+    }
+  }, [])
+
+  const attachWorker = useCallback((worker) => {
     worker.onmessage = (event) => {
       const { id, result, error, type, filename } = event.data
 
@@ -67,18 +75,40 @@ export function useIOWorker({ onError, onWriteFlushed } = {}) {
       setIsReady(false)
       rejectAllPending(error)
       onErrorRef.current?.(error)
+      workerRef.current = null
+      createWorkerRef.current?.()
+    }
+  }, [rejectAllPending])
+
+  const createWorker = useCallback(() => {
+    if (workerRef.current) {
+      workerRef.current.terminate()
+      workerRef.current = null
     }
 
+    const worker = new Worker(
+      new URL('../workers/io.worker.js', import.meta.url),
+      { type: 'classic' }
+    )
+
+    attachWorker(worker)
     workerRef.current = worker
     setIsReady(true)
+    flushScheduledWrites()
+  }, [attachWorker, flushScheduledWrites])
+
+  createWorkerRef.current = createWorker
+
+  useEffect(() => {
+    createWorker()
 
     return () => {
       setIsReady(false)
       rejectAllPending(new Error('Workspace I/O worker stopped'))
-      worker.terminate()
+      workerRef.current?.terminate()
       workerRef.current = null
     }
-  }, [rejectAllPending])
+  }, [createWorker, rejectAllPending])
 
   const callWorker = useCallback((payload) => {
     if (!workerRef.current) {
@@ -94,7 +124,12 @@ export function useIOWorker({ onError, onWriteFlushed } = {}) {
 
   const scheduleWrite = useCallback((filename, content) => {
     if (!workerRef.current) {
-      onErrorRef.current?.(new Error('Workspace I/O worker is not ready'))
+      scheduledWritesRef.current.push({
+        type: 'schedule_write',
+        filename,
+        content,
+      })
+      createWorkerRef.current?.()
       return
     }
 

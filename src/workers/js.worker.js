@@ -7,7 +7,12 @@ let stdoutBuffer = ''
 let stderrBuffer = ''
 let flushInterval = null
 let isRunning = false
-const timerHandles = new Set()
+let executionError = null
+let runnerSettled = false
+let pendingMicrotasks = 0
+let pendingAsyncCallbacks = 0
+let completionResolver = null
+const timerHandles = new Map()
 
 function postStatus(status) {
   self.postMessage({ type: 'status', status })
@@ -53,21 +58,64 @@ function stopFlushing() {
   flushOutput()
 }
 
-function clearTrackedTimers() {
-  for (const handle of timerHandles) {
-    clearTimeout(handle)
-    clearInterval(handle)
+function maybeFinishExecution() {
+  if (
+    runnerSettled &&
+    timerHandles.size === 0 &&
+    pendingMicrotasks === 0 &&
+    pendingAsyncCallbacks === 0 &&
+    completionResolver
+  ) {
+    const resolve = completionResolver
+    completionResolver = null
+    resolve()
   }
-  timerHandles.clear()
 }
 
-function trackTimer(handle) {
-  timerHandles.add(handle)
+function waitForPendingAsyncWork() {
+  if (
+    timerHandles.size === 0 &&
+    pendingMicrotasks === 0 &&
+    pendingAsyncCallbacks === 0
+  ) {
+    return Promise.resolve()
+  }
+
+  return new Promise((resolve) => {
+    completionResolver = resolve
+  })
+}
+
+function clearTrackedTimers() {
+  for (const [handle, kind] of timerHandles) {
+    if (kind === 'interval') {
+      clearInterval(handle)
+    } else {
+      clearTimeout(handle)
+    }
+  }
+
+  timerHandles.clear()
+  maybeFinishExecution()
+}
+
+function trackTimer(handle, kind) {
+  timerHandles.set(handle, kind)
   return handle
 }
 
 function untrackTimer(handle) {
   timerHandles.delete(handle)
+  maybeFinishExecution()
+}
+
+function resetExecutionState() {
+  clearTrackedTimers()
+  executionError = null
+  runnerSettled = false
+  pendingMicrotasks = 0
+  pendingAsyncCallbacks = 0
+  completionResolver = null
 }
 
 function isErrorLike(value) {
@@ -108,8 +156,10 @@ function stringifyValue(value) {
           if (seen.has(currentValue)) {
             return '[Circular]'
           }
+
           seen.add(currentValue)
         }
+
         return currentValue
       },
       2,
@@ -149,11 +199,29 @@ function createConsoleProxy() {
   }
 }
 
-function stripExportKeywords(source) {
-  return source
-    .replace(/^\s*export\s+\{[^}]*\};?\s*$/gm, '')
-    .replace(/^\s*export\s+default\s+/gm, '')
-    .replace(/^\s*export\s+(?=(?:async\s+)?function|class|const|let|var)/gm, '')
+function validateRuntimeSource(source, filename) {
+  const fileName = String(filename || DEFAULT_FILENAME)
+  const code = String(source ?? '')
+
+  if (/^\s*(?:import|export)\s/m.test(code)) {
+    throw new Error('ES module syntax is not supported in the JS worker yet.')
+  }
+
+  if (!/\.ts$/i.test(fileName)) {
+    return
+  }
+
+  if (/^\s*import\s+[^=\n]+\s*=\s*require\s*\(/m.test(code)) {
+    throw new Error('TypeScript import=require syntax is not supported in the JS worker.')
+  }
+
+  if (/^\s*export\s*=\s*/m.test(code)) {
+    throw new Error('TypeScript export= syntax is not supported in the JS worker.')
+  }
+
+  if (/^\s*(?:namespace|module)\s+\w+/m.test(code)) {
+    throw new Error('TypeScript namespace syntax is not supported in the JS worker.')
+  }
 }
 
 function buildSourceUrl(filename) {
@@ -178,20 +246,64 @@ function normalizeRuntimeSource(source, filename) {
   const fileName = String(filename || DEFAULT_FILENAME)
   let code = String(source ?? '')
 
+  validateRuntimeSource(code, fileName)
+
   if (/\.tsx$/i.test(fileName)) {
     throw new Error('TSX/JSX execution is not supported in the JS worker yet.')
   }
 
   if (/\.ts$/i.test(fileName)) {
     code = transpileTypeScript(code, fileName)
-    code = stripExportKeywords(code)
   }
 
-  if (/^\s*import\s/m.test(code)) {
-    throw new Error('ES module imports are not supported in the JS worker yet.')
+  if (/\brequire\s*\(/m.test(code) || /\bmodule\.exports\b/m.test(code) || /\bexports\./m.test(code)) {
+    throw new Error('CommonJS module syntax is not supported in the JS worker.')
   }
 
   return `${code}\n//# sourceURL=${buildSourceUrl(fileName)}`
+}
+
+function reportExecutionError(errorLike) {
+  const message = errorLike?.stack || errorLike?.message || String(errorLike)
+
+  if (!executionError) {
+    executionError = message
+  }
+
+  appendOutput('stderr', `${message}\n`)
+  clearTrackedTimers()
+}
+
+async function invokeCallback(callback, args = []) {
+  pendingAsyncCallbacks += 1
+
+  try {
+    await callback(...args)
+  } catch (error) {
+    reportExecutionError(error)
+  } finally {
+    pendingAsyncCallbacks -= 1
+    maybeFinishExecution()
+  }
+}
+
+function queueMicrotaskProxy(callback) {
+  if (typeof callback !== 'function') {
+    throw new TypeError('queueMicrotask callback must be a function')
+  }
+
+  pendingMicrotasks += 1
+  queueMicrotask(() => {
+    void Promise.resolve()
+      .then(() => callback())
+      .catch((error) => {
+        reportExecutionError(error)
+      })
+      .finally(() => {
+        pendingMicrotasks -= 1
+        maybeFinishExecution()
+      })
+  })
 }
 
 function createSandboxScope() {
@@ -199,11 +311,32 @@ function createSandboxScope() {
   const sandboxGlobal = Object.create(null)
 
   const setTimeoutProxy = (callback, delay = 0, ...args) => {
-    return trackTimer(setTimeout(callback, delay, ...args))
+    if (typeof callback !== 'function') {
+      throw new TypeError('setTimeout callback must be a function')
+    }
+
+    let handle = null
+    const wrapped = () => {
+      untrackTimer(handle)
+      void invokeCallback(callback, args)
+    }
+
+    handle = setTimeout(wrapped, delay)
+    return trackTimer(handle, 'timeout')
   }
 
   const setIntervalProxy = (callback, delay = 0, ...args) => {
-    return trackTimer(setInterval(callback, delay, ...args))
+    if (typeof callback !== 'function') {
+      throw new TypeError('setInterval callback must be a function')
+    }
+
+    let handle = null
+    const wrapped = () => {
+      void invokeCallback(callback, args)
+    }
+
+    handle = setInterval(wrapped, delay)
+    return trackTimer(handle, 'interval')
   }
 
   const clearTimeoutProxy = (handle) => {
@@ -224,7 +357,7 @@ function createSandboxScope() {
     clearTimeout: clearTimeoutProxy,
     setInterval: setIntervalProxy,
     clearInterval: clearIntervalProxy,
-    queueMicrotask,
+    queueMicrotask: queueMicrotaskProxy,
     structuredClone,
     URL,
     URLSearchParams,
@@ -238,11 +371,11 @@ function createSandboxScope() {
     Boolean,
     DataView,
     Date,
-    Infinity,
     Error,
     EvalError,
     Float32Array,
     Float64Array,
+    Infinity,
     Int8Array,
     Int16Array,
     Int32Array,
@@ -284,12 +417,13 @@ function createSandboxScope() {
     location: undefined,
     caches: undefined,
     indexedDB: undefined,
-    isFinite,
-    isNaN,
     Function: undefined,
     eval: undefined,
+    isFinite,
+    isNaN,
     parseFloat,
     parseInt,
+    performance,
   })
 
   return new Proxy(sandboxGlobal, {
@@ -308,17 +442,41 @@ function createSandboxScope() {
   })
 }
 
+function createWorkerErrorHandlers() {
+  const handleUnhandledRejection = (event) => {
+    event.preventDefault?.()
+    reportExecutionError(event.reason || new Error('Unhandled promise rejection'))
+  }
+
+  const handleWorkerError = (event) => {
+    if (!isRunning) {
+      return
+    }
+
+    event.preventDefault?.()
+    reportExecutionError(event.error || new Error(event.message || 'Unhandled worker error'))
+  }
+
+  self.addEventListener('unhandledrejection', handleUnhandledRejection)
+  self.addEventListener('error', handleWorkerError)
+
+  return () => {
+    self.removeEventListener('unhandledrejection', handleUnhandledRejection)
+    self.removeEventListener('error', handleWorkerError)
+  }
+}
+
 async function runUserCode(code, filename) {
   if (isRunning) {
     throw new Error('A JS/TS program is already running')
   }
 
   isRunning = true
-  clearTrackedTimers()
+  resetExecutionState()
   startFlushing()
   postStatus(/\.ts$/i.test(filename || '') ? 'Transpiling TypeScript...' : 'Executing JavaScript...')
 
-  let error = null
+  const cleanupErrorHandlers = createWorkerErrorHandlers()
 
   try {
     const executableSource = normalizeRuntimeSource(code, filename)
@@ -332,15 +490,19 @@ ${executableSource}
     `)
 
     await runner(scope)
-  } catch (err) {
-    error = err?.stack || err?.message || String(err)
-    appendOutput('stderr', `${error}\n`)
+    runnerSettled = true
+    maybeFinishExecution()
+    await waitForPendingAsyncWork()
+  } catch (error) {
+    reportExecutionError(error)
   } finally {
+    cleanupErrorHandlers()
     clearTrackedTimers()
     stopFlushing()
     isRunning = false
-    self.postMessage({ type: 'done', error })
+    self.postMessage({ type: 'done', error: executionError })
     postStatus('JS/TS runtime ready')
+    resetExecutionState()
   }
 }
 
@@ -363,6 +525,7 @@ self.onmessage = async (event) => {
       isRunning = false
       self.postMessage({ type: 'done', error: 'Execution killed by user' })
       postStatus('JS/TS runtime ready')
+      resetExecutionState()
       break
 
     default:

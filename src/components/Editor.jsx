@@ -24,7 +24,7 @@ function persistDraft(filename, content) {
   }
 }
 
-function Editor({ code, filename, onChange, onMount, language = 'python' }) {
+function Editor({ code, filename, onChange, onMount, language = 'python', readOnly = false }) {
   const editorRef = useRef(null)
   const modelChangeDisposableRef = useRef(null)
   const filenameRef = useRef(filename)
@@ -67,6 +67,7 @@ function Editor({ code, filename, onChange, onMount, language = 'python' }) {
         fontSize: 14,
         fontFamily: '"Cascadia Code", "Fira Code", "JetBrains Mono", Consolas, monospace',
         fontLigatures: true,
+        readOnly,
         minimap: { enabled: false },
         scrollBeyondLastLine: false,
         lineNumbers: 'on',

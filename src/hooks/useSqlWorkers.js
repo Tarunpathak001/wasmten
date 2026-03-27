@@ -21,6 +21,14 @@ function createReadyState() {
   }
 }
 
+function createWorkerError(message, details = null) {
+  const error = new Error(message)
+  if (details) {
+    error.details = details
+  }
+  return error
+}
+
 export function useSqlWorkers({ onError } = {}) {
   const workerRefs = useRef({
     sqlite: null,
@@ -28,6 +36,7 @@ export function useSqlWorkers({ onError } = {}) {
   })
   const pendingRequestsRef = useRef(createPendingMap())
   const nextRequestIdRef = useRef(0)
+  const activeExecutionEngineRef = useRef(null)
   const onErrorRef = useRef(onError)
   const [readyState, setReadyState] = useState(createReadyState)
   const [statusState, setStatusState] = useState(createStatusState)
@@ -60,70 +69,100 @@ export function useSqlWorkers({ onError } = {}) {
     }))
   }, [])
 
-  useEffect(() => {
-    function attachWorker(engine, worker) {
-      worker.onmessage = (event) => {
-        const { type, id, error, status, payload } = event.data
+  const attachWorker = useCallback((engine, worker) => {
+    worker.onmessage = (event) => {
+      const { type, id, error, status, payload, details } = event.data
 
-        switch (type) {
-          case 'ready':
-            updateReady(engine, true)
-            return
+      switch (type) {
+        case 'ready':
+          updateReady(engine, true)
+          return
 
-          case 'status':
-            updateStatus(engine, status)
-            return
+        case 'status':
+          updateStatus(engine, status)
+          return
 
-          case 'result': {
-            const pending = pendingRequestsRef.current[engine].get(id)
-            if (!pending) {
-              return
-            }
-
-            pendingRequestsRef.current[engine].delete(id)
-            pending.resolve(payload)
+        case 'result': {
+          const pending = pendingRequestsRef.current[engine].get(id)
+          if (!pending) {
             return
           }
 
-          case 'error': {
-            const pending = pendingRequestsRef.current[engine].get(id)
-            if (pending) {
-              pendingRequestsRef.current[engine].delete(id)
-              pending.reject(new Error(error || `${engine} query failed`))
-              return
-            }
-
-            onErrorRef.current?.(new Error(error || `${engine} worker failed`), engine)
-            return
-          }
-
-          default:
-            return
+          pendingRequestsRef.current[engine].delete(id)
+          pending.resolve(payload)
+          return
         }
-      }
 
-      worker.onerror = (event) => {
-        const error = new Error(event.message || `${engine} worker crashed`)
-        updateReady(engine, false)
-        updateStatus(engine, `${engine === 'sqlite' ? 'SQLite' : 'PostgreSQL'} worker crashed`)
-        rejectPendingForEngine(engine, error)
-        onErrorRef.current?.(error, engine)
+        case 'error': {
+          const workerError = new Error(error || `${engine} query failed`)
+          if (details) {
+            workerError.details = details
+          }
+
+          const pending = pendingRequestsRef.current[engine].get(id)
+          if (pending) {
+            pendingRequestsRef.current[engine].delete(id)
+            pending.reject(workerError)
+            return
+          }
+
+          onErrorRef.current?.(workerError, engine)
+          return
+        }
+
+        default:
+          return
       }
     }
 
-    const sqliteWorker = new Worker(
-      new URL('../workers/sqlite.worker.js', import.meta.url),
-      { type: 'module' },
-    )
-    const pgliteWorker = new Worker(
-      new URL('../workers/pglite.worker.js', import.meta.url),
-      { type: 'module' },
-    )
+    worker.onerror = (event) => {
+      const error = new Error(event.message || `${engine} worker crashed`)
+      updateReady(engine, false)
+      updateStatus(engine, `${engine === 'sqlite' ? 'SQLite' : 'PostgreSQL'} worker crashed`)
+      rejectPendingForEngine(engine, error)
+      onErrorRef.current?.(error, engine)
+    }
+  }, [rejectPendingForEngine, updateReady, updateStatus])
 
-    workerRefs.current.sqlite = sqliteWorker
-    workerRefs.current.pglite = pgliteWorker
-    attachWorker('sqlite', sqliteWorker)
-    attachWorker('pglite', pgliteWorker)
+  const createWorker = useCallback((engine) => {
+    const worker = engine === 'sqlite'
+      ? new Worker(new URL('../workers/sqlite.worker.js', import.meta.url), { type: 'module' })
+      : new Worker(new URL('../workers/pglite.worker.js', import.meta.url), { type: 'module' })
+
+    workerRefs.current[engine] = worker
+    attachWorker(engine, worker)
+    return worker
+  }, [attachWorker])
+
+  const restartWorker = useCallback((engine, options = {}) => {
+    const worker = workerRefs.current[engine]
+    const {
+      rejectionError = createWorkerError(`${engine} worker restarted`),
+      nextStatus = engine === 'sqlite'
+        ? 'Loading SQLite runtime...'
+        : 'Loading PostgreSQL runtime...',
+    } = options
+
+    if (worker) {
+      rejectPendingForEngine(engine, rejectionError)
+
+      try {
+        worker.postMessage({ type: 'dispose' })
+      } catch {
+        // Ignore shutdown races during restart.
+      }
+
+      worker.terminate()
+    }
+
+    updateReady(engine, false)
+    updateStatus(engine, nextStatus)
+    return createWorker(engine)
+  }, [createWorker, rejectPendingForEngine, updateReady, updateStatus])
+
+  useEffect(() => {
+    createWorker('sqlite')
+    createWorker('pglite')
 
     return () => {
       Object.entries(workerRefs.current).forEach(([engine, worker]) => {
@@ -147,7 +186,7 @@ export function useSqlWorkers({ onError } = {}) {
         pglite: null,
       }
     }
-  }, [rejectPendingForEngine, updateReady, updateStatus])
+  }, [createWorker, rejectPendingForEngine])
 
   const callWorker = useCallback((engine, payload, transfer = []) => {
     const worker = workerRefs.current[engine]
@@ -164,20 +203,24 @@ export function useSqlWorkers({ onError } = {}) {
   }, [])
 
   const runEngineQuery = useCallback(async (engine, payload, transfer = []) => {
-    if (isRunning) {
+    if (activeExecutionEngineRef.current) {
       throw new Error('Another SQL query is already running')
     }
 
+    activeExecutionEngineRef.current = engine
     setIsRunning(true)
     setRunningEngine(engine)
 
     try {
       return await callWorker(engine, { type: 'execute', ...payload }, transfer)
     } finally {
+      if (activeExecutionEngineRef.current === engine) {
+        activeExecutionEngineRef.current = null
+      }
       setIsRunning(false)
       setRunningEngine(null)
     }
-  }, [callWorker, isRunning])
+  }, [callWorker])
 
   const runSqliteQuery = useCallback((payload) => {
     const transfer = payload.databaseBuffer ? [payload.databaseBuffer] : []
@@ -185,8 +228,31 @@ export function useSqlWorkers({ onError } = {}) {
   }, [runEngineQuery])
 
   const runPgliteQuery = useCallback((payload) => {
-    return runEngineQuery('pglite', payload)
-  }, [runEngineQuery])
+    return runEngineQuery('pglite', payload).catch(async (error) => {
+      if (!error.details?.requiresWorkerReset || payload.resetDatabaseFirst) {
+        throw error
+      }
+
+      restartWorker('pglite', {
+        rejectionError: createWorkerError('PostgreSQL worker restarted for storage recovery', {
+          kind: 'worker_restart',
+        }),
+      })
+      return runEngineQuery('pglite', {
+        ...payload,
+        resetDatabaseFirst: true,
+      })
+    })
+  }, [restartWorker, runEngineQuery])
+
+  const killSqlWorker = useCallback((engine) => {
+    restartWorker(engine, {
+      rejectionError: createWorkerError('Killed by user', { kind: 'killed' }),
+      nextStatus: engine === 'sqlite'
+        ? 'SQLite runtime reset'
+        : 'PostgreSQL runtime reset',
+    })
+  }, [restartWorker])
 
   return {
     sqliteReady: readyState.sqlite,
@@ -197,5 +263,6 @@ export function useSqlWorkers({ onError } = {}) {
     runningEngine,
     runSqliteQuery,
     runPgliteQuery,
+    killSqlWorker,
   }
 }

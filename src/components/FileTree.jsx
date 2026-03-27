@@ -1,4 +1,4 @@
-function FileTree({ files, activeFile, onFileSelect, onNewFile }) {
+function FileTree({ files, activeFile, onFileSelect, onNewFile, disabled = false }) {
   return (
     <div style={{
       width: '100%',
@@ -26,20 +26,28 @@ function FileTree({ files, activeFile, onFileSelect, onNewFile }) {
           Explorer
         </span>
         <button
-          onClick={onNewFile}
-          title="New File"
+          onClick={disabled ? undefined : onNewFile}
+          title={disabled ? 'Finish or kill the active terminal run before creating files' : 'New File'}
+          disabled={disabled}
           style={{
             background: 'none',
             border: 'none',
-            color: '#8b949e',
-            cursor: 'pointer',
+            color: disabled ? '#484f58' : '#8b949e',
+            cursor: disabled ? 'not-allowed' : 'pointer',
             fontSize: '16px',
             padding: '2px 4px',
             lineHeight: 1,
             borderRadius: '4px',
+            opacity: disabled ? 0.7 : 1,
           }}
-          onMouseEnter={e => e.target.style.color = '#c9d1d9'}
-          onMouseLeave={e => e.target.style.color = '#8b949e'}
+          onMouseEnter={(event) => {
+            if (!disabled) {
+              event.target.style.color = '#c9d1d9'
+            }
+          }}
+          onMouseLeave={(event) => {
+            event.target.style.color = disabled ? '#484f58' : '#8b949e'
+          }}
         >
           +
         </button>
@@ -61,6 +69,7 @@ function FileTree({ files, activeFile, onFileSelect, onNewFile }) {
               key={file.name}
               file={file}
               isActive={file.name === activeFile}
+              disabled={disabled}
               onClick={() => onFileSelect(file.name)}
             />
           ))
@@ -70,32 +79,51 @@ function FileTree({ files, activeFile, onFileSelect, onNewFile }) {
   )
 }
 
-function FileItem({ file, isActive, onClick }) {
-  const icon = getFileIcon(file.name)
+function FileItem({ file, isActive, onClick, disabled = false }) {
+  const badge = getFileBadge(file.name)
 
   return (
     <div
-      onClick={onClick}
+      onClick={disabled ? undefined : onClick}
       style={{
         padding: '4px 12px',
-        cursor: 'pointer',
+        cursor: disabled ? 'not-allowed' : 'pointer',
         display: 'flex',
         alignItems: 'center',
-        gap: '6px',
+        gap: '8px',
         fontSize: '13px',
-        color: isActive ? '#c9d1d9' : '#8b949e',
+        color: disabled ? '#6e7681' : isActive ? '#c9d1d9' : '#8b949e',
         background: isActive ? '#1f2937' : 'transparent',
         borderLeft: isActive ? '2px solid #58a6ff' : '2px solid transparent',
         transition: 'background 0.1s',
+        opacity: disabled ? 0.75 : 1,
       }}
-      onMouseEnter={e => {
-        if (!isActive) e.currentTarget.style.background = '#1c2128'
+      onMouseEnter={(event) => {
+        if (!isActive && !disabled) {
+          event.currentTarget.style.background = '#1c2128'
+        }
       }}
-      onMouseLeave={e => {
-        if (!isActive) e.currentTarget.style.background = 'transparent'
+      onMouseLeave={(event) => {
+        if (!isActive) {
+          event.currentTarget.style.background = 'transparent'
+        }
       }}
     >
-      <span style={{ fontSize: '14px' }}>{icon}</span>
+      <span
+        style={{
+          minWidth: '30px',
+          fontSize: '10px',
+          fontWeight: 700,
+          color: disabled ? '#6e7681' : '#58a6ff',
+          background: '#0f1722',
+          border: '1px solid #30363d',
+          borderRadius: '999px',
+          padding: '2px 6px',
+          textAlign: 'center',
+        }}
+      >
+        {badge}
+      </span>
       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {file.name}
       </span>
@@ -103,17 +131,25 @@ function FileItem({ file, isActive, onClick }) {
   )
 }
 
-function getFileIcon(filename) {
+function getFileBadge(filename) {
   const ext = filename.split('.').pop()?.toLowerCase()
   switch (ext) {
-    case 'py':   return '🐍'
-    case 'js':   return '📜'
-    case 'ts':   return '📘'
-    case 'sql':  return '🗃️'
-    case 'pg':   return '🐘'
-    case 'json': return '📋'
-    case 'md':   return '📝'
-    default:     return '📄'
+    case 'py':
+      return 'PY'
+    case 'js':
+      return 'JS'
+    case 'ts':
+      return 'TS'
+    case 'sql':
+      return 'SQL'
+    case 'pg':
+      return 'PG'
+    case 'json':
+      return 'JSON'
+    case 'md':
+      return 'MD'
+    default:
+      return 'FILE'
   }
 }
 

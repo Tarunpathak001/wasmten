@@ -162,7 +162,7 @@ async function syncWorkspaceFromOpfs() {
     }
 
     const file = await handle.getFile()
-    opfsFiles.set(name, await file.text())
+    opfsFiles.set(name, new Uint8Array(await file.arrayBuffer()))
   }
 
   const mountedFiles = pyodide.FS.readdir('/workspace').filter((name) => !['.', '..'].includes(name))
@@ -177,7 +177,7 @@ async function syncWorkspaceFromOpfs() {
   }
 
   for (const [name, content] of opfsFiles) {
-    pyodide.FS.writeFile(`/workspace/${name}`, content, { encoding: 'utf8' })
+    pyodide.FS.writeFile(`/workspace/${name}`, content)
   }
 }
 

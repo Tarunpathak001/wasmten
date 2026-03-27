@@ -39,6 +39,20 @@ function createFileRecord(name, content = "") {
   return { name, content, language: getLanguage(name) };
 }
 
+function normalizeWorkspaceFilename(name) {
+  const normalized = String(name ?? "").replace(/^\/?workspace\//u, "").trim();
+
+  if (!normalized) {
+    throw new Error("File name is required.");
+  }
+
+  if (normalized.includes("/") || normalized.includes("\\")) {
+    throw new Error("Nested folders are not supported yet. Use a single file name.");
+  }
+
+  return normalized;
+}
+
 function chooseActiveFile(filenames, preferredFile) {
   if (preferredFile && filenames.includes(preferredFile)) {
     return preferredFile;
@@ -61,9 +75,12 @@ function createEmptySqlExecution() {
     databaseLabel: "",
     resultSets: [],
     error: "",
+    errorMeta: null,
     durationMs: null,
     executedAt: null,
+    recoveryMessage: "",
     restoredFromOpfs: false,
+    storageRecovered: false,
   };
 }
 
@@ -206,6 +223,7 @@ export default function App() {
     runningEngine,
     runSqliteQuery,
     runPgliteQuery,
+    killSqlWorker,
   } = useSqlWorkers({
     onError: (error, engine) => {
       reportWorkspaceError(
@@ -392,6 +410,7 @@ export default function App() {
           if (submitted) {
             setStatus("Running...");
           }
+          return submitted;
         },
       });
     },
@@ -428,36 +447,137 @@ export default function App() {
         throw new Error("No SQLite database descriptor available");
       }
 
+      setSqlExecution({
+        ...createEmptySqlExecution(),
+        engine: "sqlite",
+        engineLabel: "SQLite",
+        filename,
+        databaseLabel: database.databaseLabel,
+        executedAt: Date.now(),
+      });
+
       const snapshotExists = await fileExists(database.databaseKey, "sqlite");
       const databaseBuffer = snapshotExists
         ? await readBinaryFile(database.databaseKey, "sqlite")
         : null;
+      const hadSnapshotBytes = Boolean(
+        databaseBuffer && databaseBuffer.byteLength > 0,
+      );
 
-      const result = await runSqliteQuery({
-        sql: code,
-        databaseKey: database.databaseKey,
-        databaseLabel: database.databaseLabel,
-        databaseBuffer,
-      });
-      const { databaseBuffer: exportedDatabase, ...uiResult } = result;
+      const persistExecutionResult = async ({
+        executionResult,
+        restoredFromOpfs,
+        recoveryMessage = "",
+        storageRecovered = false,
+      }) => {
+        const { databaseBuffer: exportedDatabase, ...uiResult } = executionResult;
 
-      if (exportedDatabase) {
-        await writeBinaryFile(
-          database.databaseKey,
-          exportedDatabase,
-          "sqlite",
-        );
+        if (exportedDatabase) {
+          try {
+            await writeBinaryFile(
+              database.databaseKey,
+              exportedDatabase,
+              "sqlite",
+            );
+          } catch (error) {
+            killSqlWorker("sqlite");
+            const persistenceError = new Error(
+              `SQLite executed successfully, but persisting ${database.databaseLabel} back to OPFS failed. The in-memory database was reset so the next run reloads the last durable snapshot.`,
+            );
+            persistenceError.details = {
+              engine: "sqlite",
+              kind: "persistence",
+              phase: "persist",
+              databaseKey: database.databaseKey,
+              databaseLabel: database.databaseLabel,
+              cause: error.message || String(error),
+            };
+            throw persistenceError;
+          }
+        }
+
+        setSqlExecution({
+          ...uiResult,
+          filename,
+          databaseLabel: database.databaseLabel,
+          executedAt: Date.now(),
+          restoredFromOpfs,
+          recoveryMessage,
+          storageRecovered,
+        });
+
+        if (recoveryMessage) {
+          terminalRef.current?.writeln(
+            `\x1b[33m[WasmForge] ${recoveryMessage}\x1b[0m`,
+          );
+        }
+      };
+
+      try {
+        const result = await runSqliteQuery({
+          sql: code,
+          databaseKey: database.databaseKey,
+          databaseLabel: database.databaseLabel,
+          databaseBuffer,
+        });
+
+        await persistExecutionResult({
+          executionResult: result,
+          restoredFromOpfs: snapshotExists,
+        });
+      } catch (error) {
+        const canRecoverSnapshot =
+          error?.details?.kind === "database_state" &&
+          hadSnapshotBytes;
+
+        if (!canRecoverSnapshot) {
+          throw error;
+        }
+
+        const recoveryMessage = `Recovered ${database.databaseLabel} by resetting an incompatible SQLite snapshot in OPFS and retrying the query. The old stored database contents could not be opened safely and were discarded.`;
+
+        try {
+          await writeBinaryFile(
+            database.databaseKey,
+            new ArrayBuffer(0),
+            "sqlite",
+          );
+        } catch (recoveryError) {
+          const resetError = new Error(
+            `Failed to reset the corrupted SQLite snapshot for ${database.databaseLabel}: ${recoveryError.message || recoveryError}`,
+          );
+          resetError.details = {
+            engine: "sqlite",
+            kind: "database_state",
+            phase: "recover",
+            databaseKey: database.databaseKey,
+            databaseLabel: database.databaseLabel,
+          };
+          throw resetError;
+        }
+
+        const recoveredResult = await runSqliteQuery({
+          sql: code,
+          databaseKey: database.databaseKey,
+          databaseLabel: database.databaseLabel,
+          databaseBuffer: new ArrayBuffer(0),
+        });
+
+        await persistExecutionResult({
+          executionResult: recoveredResult,
+          restoredFromOpfs: false,
+          recoveryMessage,
+          storageRecovered: true,
+        });
       }
-
-      setSqlExecution({
-        ...uiResult,
-        filename,
-        databaseLabel: database.databaseLabel,
-        executedAt: Date.now(),
-        restoredFromOpfs: snapshotExists,
-      });
     },
-    [fileExists, readBinaryFile, runSqliteQuery, writeBinaryFile],
+    [
+      fileExists,
+      killSqlWorker,
+      readBinaryFile,
+      runSqliteQuery,
+      writeBinaryFile,
+    ],
   );
 
   const executePgliteFile = useCallback(
@@ -466,6 +586,15 @@ export default function App() {
       if (!database) {
         throw new Error("No PostgreSQL database descriptor available");
       }
+
+      setSqlExecution({
+        ...createEmptySqlExecution(),
+        engine: "pglite",
+        engineLabel: "PostgreSQL (PGlite)",
+        filename,
+        databaseLabel: database.databaseLabel,
+        executedAt: Date.now(),
+      });
 
       const result = await runPgliteQuery({
         sql: code,
@@ -478,8 +607,13 @@ export default function App() {
         filename,
         databaseLabel: database.databaseLabel,
         executedAt: Date.now(),
-        restoredFromOpfs: true,
       });
+
+      if (result.recoveryMessage) {
+        terminalRef.current?.writeln(
+          `\x1b[33m[WasmForge] ${result.recoveryMessage}\x1b[0m`,
+        );
+      }
     },
     [runPgliteQuery],
   );
@@ -552,8 +686,18 @@ export default function App() {
       return;
     }
 
+    if (getRuntimeKind(activeFileRef.current) === "sqlite") {
+      killSqlWorker("sqlite");
+      return;
+    }
+
+    if (getRuntimeKind(activeFileRef.current) === "pglite") {
+      killSqlWorker("pglite");
+      return;
+    }
+
     killWorker();
-  }, [killJsWorker, killWorker]);
+  }, [killJsWorker, killSqlWorker, killWorker]);
 
   const handleRun = useCallback(async () => {
     terminalRef.current?.cancelInput({ newline: false });
@@ -607,10 +751,9 @@ export default function App() {
         try {
           await flushAllWrites();
         } catch (error) {
-          reportWorkspaceError(
-            `[WasmForge] Failed to persist files before JS/TS execution: ${error.message || error}`,
+          terminalRef.current?.writeln(
+            `\x1b[33m[WasmForge] Workspace autosave is behind (${error.message || error}). Running the in-memory JS/TS snapshot anyway.\x1b[0m`,
           );
-          return;
         }
 
         runJsCode({
@@ -657,7 +800,12 @@ export default function App() {
             engineLabel: "SQLite",
             filename: activeFile,
             databaseLabel: database?.databaseLabel ?? "",
-            error: error.message || String(error),
+            error:
+              error?.details?.kind === "killed"
+                ? "Execution killed by user."
+                : error.message || String(error),
+            errorMeta: error.details || null,
+            recoveryMessage: error?.details?.recoveryMessage || "",
             executedAt: Date.now(),
           });
         }
@@ -701,7 +849,12 @@ export default function App() {
             engineLabel: "PostgreSQL (PGlite)",
             filename: activeFile,
             databaseLabel: database?.databaseLabel ?? "",
-            error: error.message || String(error),
+            error:
+              error?.details?.kind === "killed"
+                ? "Execution killed by user."
+                : error.message || String(error),
+            errorMeta: error.details || null,
+            recoveryMessage: error?.details?.recoveryMessage || "",
             executedAt: Date.now(),
           });
         }
@@ -730,6 +883,13 @@ export default function App() {
 
   const handleFileSelect = useCallback(
     async (name) => {
+      if ((isRunning || isJsRunning) && name !== activeFileRef.current) {
+        terminalRef.current?.writeln(
+          "\x1b[33m[WasmForge] Finish or kill the active Python/JS program before switching files.\x1b[0m",
+        );
+        return;
+      }
+
       try {
         syncActiveEditorDraft();
         await flushAllWrites();
@@ -744,6 +904,8 @@ export default function App() {
     },
     [
       flushAllWrites,
+      isJsRunning,
+      isRunning,
       readFile,
       upsertFileContent,
       reportWorkspaceError,
@@ -765,12 +927,26 @@ export default function App() {
   );
 
   const handleNewFile = useCallback(async () => {
+    if (isRunning || isJsRunning) {
+      terminalRef.current?.writeln(
+        "\x1b[33m[WasmForge] Finish or kill the active Python/JS program before creating files.\x1b[0m",
+      );
+      return;
+    }
+
     const name = prompt("File name (e.g. script.py, query.sql):");
     if (!name || !name.trim()) {
       return;
     }
 
-    const trimmed = name.trim();
+    let trimmed;
+    try {
+      trimmed = normalizeWorkspaceFilename(name);
+    } catch (error) {
+      alert(error.message || String(error));
+      return;
+    }
+
     if (files.some((file) => file.name === trimmed)) {
       alert("File already exists.");
       return;
@@ -786,19 +962,26 @@ export default function App() {
       return;
     }
 
-    setFiles((prev) =>
-      sortFileRecords([...prev, createFileRecord(trimmed, "")]),
-    );
-    setActiveFile(trimmed);
-
     try {
       await writeFile(trimmed, "");
+      setFiles((prev) =>
+        sortFileRecords([...prev, createFileRecord(trimmed, "")]),
+      );
+      setActiveFile(trimmed);
     } catch (error) {
       reportWorkspaceError(
         `[WasmForge] Failed to create ${trimmed}: ${error.message || error}`,
       );
     }
-  }, [files, flushAllWrites, writeFile, reportWorkspaceError, syncActiveEditorDraft]);
+  }, [
+    files,
+    flushAllWrites,
+    isJsRunning,
+    isRunning,
+    writeFile,
+    reportWorkspaceError,
+    syncActiveEditorDraft,
+  ]);
 
   const activeFileData = files.find((file) => file.name === activeFile);
   const activeRuntime = getRuntimeKind(activeFile);
@@ -840,7 +1023,10 @@ export default function App() {
         ? jsStatus === "Execution failed" || jsStatus === "JS/TS runtime crashed"
       : Boolean(activeSqlResult?.error);
   const canKillActiveRuntime =
-    activeRuntime === "python" || activeRuntime === "javascript";
+    activeRuntime === "python" ||
+    activeRuntime === "javascript" ||
+    activeRuntime === "sqlite" ||
+    activeRuntime === "pglite";
   const terminalRuntimeLabel =
     activeRuntime === "javascript" ? "JS/TS" : "Python";
   const terminalRuntimeAccent =
@@ -946,6 +1132,7 @@ export default function App() {
             activeFile={activeFile}
             onFileSelect={handleFileSelect}
             onNewFile={handleNewFile}
+            disabled={isRunning || isJsRunning}
           />
         </div>
 
@@ -979,6 +1166,7 @@ export default function App() {
               onChange={handleCodeChange}
               onMount={handleEditorMount}
               language={getLanguage(activeFile || DEFAULT_FILENAME)}
+              readOnly={isRunning || isJsRunning}
             />
           </Suspense>
         </div>

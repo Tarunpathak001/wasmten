@@ -216,6 +216,18 @@ export default function SqlResultsPanel({
   const placeholderMessage = engine === 'sqlite'
     ? `Run ${activeFile || 'a .sql file'} to execute it against SQLite. The database snapshot persists to OPFS as a hidden .sqlite file.`
     : `Run ${activeFile || 'a .pg file'} to execute it against PostgreSQL (PGlite). The database persists natively in OPFS.`
+  const errorTitle = result?.errorMeta?.kind === 'database_state'
+    ? 'Database state failed'
+    : result?.errorMeta?.kind === 'runtime'
+      ? 'Runtime failed'
+      : result?.errorMeta?.kind === 'persistence'
+        ? 'Persistence failed'
+        : result?.errorMeta?.kind === 'busy'
+          ? 'Runtime busy'
+    : result?.errorMeta?.kind === 'killed'
+      ? 'Execution stopped'
+      : 'Query failed'
+  const hasSuccessfulResult = Boolean(result && !result.error)
 
   return (
     <div
@@ -304,21 +316,25 @@ export default function SqlResultsPanel({
         <StateCard title="Executing query" body={`${engineLabel} is running your SQL in a dedicated worker...`} tone="#f0883e" />
       ) : null}
 
+      {result?.recoveryMessage ? (
+        <StateCard title="Database recovered" body={result.recoveryMessage} tone="#d29922" />
+      ) : null}
+
       {result?.error ? (
-        <StateCard title="Query failed" body={result.error} tone="#ff7b72" />
+        <StateCard title={errorTitle} body={result.error} tone="#ff7b72" />
       ) : null}
 
       {!result && !isRunning ? (
         <StateCard title="No results yet" body={placeholderMessage} tone="#8b949e" />
       ) : null}
 
-      {result?.durationMs ? (
+      {hasSuccessfulResult && result?.durationMs ? (
         <div style={{ color: '#8b949e', fontSize: '12px', marginBottom: '12px' }}>
           Last run finished in {result.durationMs.toFixed(1)}ms.
         </div>
       ) : null}
 
-      {result && engine === 'sqlite' ? (
+      {hasSuccessfulResult && engine === 'sqlite' ? (
         <div style={{ color: '#8b949e', fontSize: '12px', marginBottom: '12px' }}>
           {result.restoredFromOpfs
             ? `Restored ${result.databaseLabel} from OPFS before executing this query.`
@@ -326,9 +342,13 @@ export default function SqlResultsPanel({
         </div>
       ) : null}
 
-      {result && engine === 'pglite' ? (
+      {hasSuccessfulResult && engine === 'pglite' ? (
         <div style={{ color: '#8b949e', fontSize: '12px', marginBottom: '12px' }}>
-          {result.databaseLabel} is running on PostgreSQL (PGlite) with native OPFS-backed storage.
+          {result.recoveryMessage
+            ? `PostgreSQL storage was reset and rebuilt for ${result.databaseLabel} before this query completed.`
+            : result.restoredFromOpfs
+              ? `Restored ${result.databaseLabel} from native OPFS-backed PostgreSQL storage.`
+              : `Created or refreshed ${result.databaseLabel} in native OPFS-backed PostgreSQL storage.`}
         </div>
       ) : null}
 

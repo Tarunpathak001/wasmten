@@ -15,6 +15,8 @@ export function useJsWorker({
 } = {}) {
   const workerRef = useRef(null)
   const spawnWorkerRef = useRef(null)
+  const respawnTimeoutRef = useRef(null)
+  const crashCountRef = useRef(0)
   const onStdoutRef = useRef(onStdout)
   const onStderrRef = useRef(onStderr)
   const onReadyRef = useRef(onReady)
@@ -44,7 +46,39 @@ export function useJsWorker({
     onProgressRef.current = onProgress
   }, [onProgress])
 
+  const clearScheduledRespawn = useCallback(() => {
+    if (respawnTimeoutRef.current) {
+      clearTimeout(respawnTimeoutRef.current)
+      respawnTimeoutRef.current = null
+    }
+  }, [])
+
+  const scheduleRespawn = useCallback(() => {
+    clearScheduledRespawn()
+
+    const attempt = crashCountRef.current + 1
+    crashCountRef.current = attempt
+    const delayMs = Math.min((attempt - 1) * 1000, 5000)
+    const statusMessage = attempt === 1
+      ? 'Recovering JS/TS runtime...'
+      : `Recovering JS/TS runtime (retry ${attempt})...`
+
+    setStatus(statusMessage)
+    onStderrRef.current?.(
+      delayMs > 0
+        ? `[WasmForge] Restarting JS/TS runtime in ${Math.ceil(delayMs / 1000)}s...\n`
+        : '[WasmForge] Restarting JS/TS runtime...\n',
+    )
+
+    respawnTimeoutRef.current = setTimeout(() => {
+      respawnTimeoutRef.current = null
+      spawnWorkerRef.current?.()
+    }, delayMs)
+  }, [clearScheduledRespawn])
+
   const spawnWorker = useCallback(() => {
+    clearScheduledRespawn()
+
     if (workerRef.current) {
       workerRef.current.terminate()
       workerRef.current = null
@@ -64,6 +98,7 @@ export function useJsWorker({
 
       switch (type) {
         case 'ready':
+          crashCountRef.current = 0
           setIsReady(true)
           setStatus('JS/TS runtime ready')
           onReadyRef.current?.()
@@ -95,18 +130,29 @@ export function useJsWorker({
 
     worker.onerror = (err) => {
       const message = err?.message || 'JS/TS worker crashed'
+
+      try {
+        worker.terminate()
+      } catch {
+        // Ignore teardown races after a crash.
+      }
+
       setIsReady(false)
       setIsRunning(false)
       setStatus('JS/TS runtime crashed')
       onStderrRef.current?.(`[WasmForge] ${message}\n`)
       onDoneRef.current?.(message)
-      workerRef.current = null
-      spawnWorkerRef.current?.()
+
+      if (workerRef.current === worker) {
+        workerRef.current = null
+      }
+
+      scheduleRespawn()
     }
 
     workerRef.current = worker
     worker.postMessage({ type: 'init' })
-  }, [])
+  }, [clearScheduledRespawn, scheduleRespawn])
 
   spawnWorkerRef.current = spawnWorker
 
@@ -137,6 +183,9 @@ export function useJsWorker({
   }, [isReady, isRunning])
 
   const killWorker = useCallback(() => {
+    clearScheduledRespawn()
+    crashCountRef.current = 0
+
     if (workerRef.current) {
       workerRef.current.terminate()
       workerRef.current = null
@@ -148,16 +197,17 @@ export function useJsWorker({
     onStderrRef.current?.('\n[WasmForge] Execution killed by user.\n')
     onDoneRef.current?.('Killed by user')
     spawnWorkerRef.current?.()
-  }, [])
+  }, [clearScheduledRespawn])
 
   useEffect(() => {
     spawnWorker()
 
     return () => {
+      clearScheduledRespawn()
       workerRef.current?.terminate()
       workerRef.current = null
     }
-  }, [spawnWorker])
+  }, [clearScheduledRespawn, spawnWorker])
 
   return {
     runCode,

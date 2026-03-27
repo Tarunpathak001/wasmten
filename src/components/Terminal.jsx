@@ -158,8 +158,20 @@ const Terminal = forwardRef(function Terminal({ onResize }, ref) {
         const submittedValue = state.buffer
         const submit = state.onSubmit
         xterm.write('\r\n')
-        inputStateRef.current = createEmptyInputState()
-        submit?.(submittedValue)
+        let accepted = true
+
+        try {
+          accepted = submit ? submit(submittedValue) !== false : true
+        } catch (error) {
+          accepted = false
+          xterm.writeln(`[WasmForge] ${error?.message || error}`)
+        }
+
+        if (accepted) {
+          inputStateRef.current = createEmptyInputState()
+        } else {
+          xterm.write(`${state.prompt}${state.buffer}`)
+        }
         return
       }
 
